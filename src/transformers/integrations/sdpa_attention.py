@@ -25,21 +25,28 @@ def sdpa_attention_forward(
     scaling: Optional[float] = None,
     is_causal: Optional[bool] = None,
     **kwargs,
-) -> Tuple[torch.Tensor, None]:
-    if hasattr(module, "num_key_value_groups"):
-        key = repeat_kv(key, module.num_key_value_groups)
-        value = repeat_kv(value, module.num_key_value_groups)
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    `query` has shape `(batch, num_heads, q_len, head_dim)`, while `key`,
+    `value` have shape `(batch, num_key_value_groups, kv_len, head_dim)`. Here,
+    `num_key_value_groups <= num_heads` and
+    `num_heads % num_key_value_groups == 0`.
 
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html#torch-nn-functional-scaled-dot-product-attention
+    `scaled_dot_product_attention` is supposed to support
+    `num_key_value_groups < num_heads`. But at least up to PyTorch 2.5.1, this
+    does not seem to be supported. The implementation here tries to use the
+    feature and otherwise broadcasts `key` and `value` accordingly and tries again.
+
+    """
+    assert query.ndim == key.ndim == value.ndim == 4
+    num_key_value_groups = key.shape[1]
+    assert value.shape[1] == num_key_value_groups
+    num_heads = query.shape[1]
+    assert num_heads % num_key_value_groups == 0
     causal_mask = attention_mask
     if attention_mask is not None:
         causal_mask = causal_mask[:, :, :, : key.shape[-2]]
-
-    # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions
-    # Reference: https://github.com/pytorch/pytorch/issues/112577.
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
-
     # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
     # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
     if is_causal is None:
@@ -50,15 +57,30 @@ def sdpa_attention_forward(
     if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
         is_causal = is_causal.item()
 
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=causal_mask,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=is_causal,
-    )
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions
+    # Reference: https://github.com/pytorch/pytorch/issues/112577.
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    for retry in range(2):
+        try:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=causal_mask,
+                dropout_p=dropout,
+                scale=scaling,
+                is_causal=is_causal,
+            )
+            break
+        except RuntimeError as ex:
+            if retry == 1 or num_key_value_groups == num_heads:
+                raise ex  # Re-throw
+            q_per_kv = num_heads // num_key_value_groups
+            key = repeat_kv(key, n_rep=q_per_kv).contiguous()
+            value = repeat_kv(value, n_rep=q_per_kv).contiguous()
 
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    # attn_output: (batch, q_len, num_heads, head_dim)
     return attn_output, None
