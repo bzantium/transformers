@@ -20,6 +20,13 @@ def flex_attention_forward(
     head_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    `query` has shape `(batch, num_heads, q_len, head_dim)`, while `key`,
+    `value` have shape `(batch, num_key_value_groups, kv_len, head_dim)`. Here,
+    `num_key_value_groups <= num_heads` and
+    `num_heads % num_key_value_groups == 0`.
+
+    """
     causal_mask = attention_mask
     if causal_mask is not None:
         causal_mask = causal_mask[:, :, :, : key.shape[-2]]
