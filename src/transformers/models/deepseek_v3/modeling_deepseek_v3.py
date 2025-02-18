@@ -68,8 +68,22 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if self.rope_type != "yarn":
+            # If we pass `config` to `rope_init_fn`, the dimension is set to a wrong
+            # value (for standard multi-head attention):
+            self._rope_kwargs = dict(
+                base=config.rope_theta, dim=config.qk_rope_head_dim,
+            )
+            if config.rope_scaling is not None:
+                self._rope_kwargs["factor"] = config.rope_scaling["factor"]
+            if config.max_position_embeddings is not None:
+                self._rope_kwargs["max_position_embeddings"] = config.max_position_embeddings
+        else:
+            # TODO: `_compute_yarn_parameters` requires `config` and will lead
+            # to wrong dimension in this case
+            self._rope_kwargs = {"config": config}
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq, self.attention_scaling = self.rope_init_fn(device=device, **self._rope_kwargs)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -81,7 +95,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         """
         seq_len = torch.max(position_ids) + 1
         if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            inv_freq, self.attention_scaling = self.rope_init_fn(device=device, seq_len=seq_len, **self._rope_kwargs)
             self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
             self.max_seq_len_cached = seq_len
 
@@ -718,9 +732,11 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     position_ids,
                     past_key_values,
                     output_attentions,
+                    False,  # output_router_logits
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    **flash_attn_kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
